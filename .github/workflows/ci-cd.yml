@@ -1,0 +1,96 @@
+name: CI CD -> GCE VM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    env:
+      REMOTE_DIR: ${{ secrets.GCE_REMOTE_DIR }}
+      SSH_USER: ${{ secrets.GCE_SSH_USER }}
+      SSH_HOST: ${{ secrets.GCE_SSH_HOST }}
+      SSH_PORT: ${{ secrets.GCE_SSH_PORT || '22' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+        # fail workflow if tests fail
+
+      - name: Create deployment artifact
+        run: |
+          mkdir -p build
+          # include package.json, src, etc
+          cp package*.json build/
+          cp -r src build/
+          cd build
+          zip -r ../artifact.zip .
+      - name: Upload artifact for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact
+          path: artifact.zip
+
+      - name: Install ssh key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GCE_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          # optional: add known hosts entry to avoid prompt
+          # echo "${{ secrets.GCE_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Copy artifact to remote
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          key: ${{ secrets.GCE_SSH_PRIVATE_KEY }}
+          source: "artifact.zip"
+          target: "${{ env.REMOTE_DIR }}"
+
+      - name: Unpack & restart on remote
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          port: ${{ env.SSH_PORT }}
+          key: ${{ secrets.GCE_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            mkdir -p "${{ env.REMOTE_DIR }}"
+            cd "${{ env.REMOTE_DIR }}"
+            # backup previous
+            if [ -d current ]; then
+              rm -rf current_prev || true
+              mv current current_prev || true
+            fi
+            mkdir -p releases
+            TIMESTAMP=$(date +%s)
+            mkdir -p releases/$TIMESTAMP
+            unzip -o artifact.zip -d releases/$TIMESTAMP
+            # move to current
+            rm -rf current
+            mv releases/$TIMESTAMP current
+            cd current
+            # install dependencies (if needed)
+            # npm ci --production   # uncomment if your app needs deps installed on the VM
+            # set correct permissions
+            chown -R ${{ env.SSH_USER }}:${{ env.SSH_USER }} ${{ env.REMOTE_DIR }}
+            # restart systemd service
+            sudo systemctl daemon-reload || true
+            sudo systemctl restart myapp || true
+            sudo systemctl status myapp --no-pager || true
